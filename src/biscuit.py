@@ -22,13 +22,15 @@ class Biscuit:
         self.model.train()
 
 
-    def compute_batch(self, prompt, segments, keep_indices_lst):
+    def compute_batch(self, prompt, segments, keep_indices_lst, no_latent=False):
         # Step 0: just process the first segment without decoding the next token
         first_segment = [prompt + segment for segment in segments[0]]
         inputs = self.tokenizer(first_segment, return_tensors="pt", padding=True).to(self.device)
         outputs = self.model(**inputs)
         kv_cache = outputs.past_key_values
         attn_mask = inputs.attention_mask
+
+        CE_loss = torch.nn.CrossEntropyLoss()
 
         loss = torch.tensor(0.).to(self.device)
         # continuous CoT loop: produce CoT -> use it to predict next segment -> repeat
@@ -39,22 +41,26 @@ class Biscuit:
             batch_size = keep_indices.shape[0]
             attn_ones = torch.ones(batch_size, 1, dtype=int).to(self.device)
 
+            if not no_latent:
+                # learn to output bot token
+                bot_token = self.tokenizer([self.bot] * batch_size, return_tensors="pt").to(self.device)
+                loss += CE_loss(outputs.logits[keep_indices, -1], bot_token.input_ids[:, 0])
 
-            # Step 2: then autoregressively predict a continuous chain of thought sequence
-            last_hidden_state = None
-            k = np.random.randint(1, COT_MAX_LENGTH + 1) # the CoT sequence has a random length
-            for i in range(k + 2):
-                attn_mask = torch.cat((attn_mask, attn_ones), dim=1)
-                if i == 0 or i == k + 1: # process beginning of thought or end of thought token
-                    seq = [self.bot if i == 0 else self.eot] * batch_size
-                    inputs = self.tokenizer(seq, return_tensors="pt").to(self.device)
-                    args = {'input_ids': inputs.input_ids}
-                else: # process new continuous thought token
-                    args = {'inputs_embeds': last_hidden_state}
-
-                outputs = self.model(**args, attention_mask=attn_mask, past_key_values=kv_cache)
-                last_hidden_state = outputs.hidden_states[-1][:, -1:]
-                kv_cache = outputs.past_key_values
+                # Step 2: then autoregressively predict a continuous chain of thought sequence
+                last_hidden_state = None
+                k = np.random.randint(1, COT_MAX_LENGTH + 1) # the CoT sequence has a random length
+                for i in range(k + 2):
+                    attn_mask = torch.cat((attn_mask, attn_ones), dim=1)
+                    if i == 0 or i == k + 1: # process beginning of thought or end of thought token
+                        seq = [self.bot if i == 0 else self.eot] * batch_size
+                        inputs = self.tokenizer(seq, return_tensors="pt").to(self.device)
+                        args = {'input_ids': inputs.input_ids}
+                    else: # process new continuous thought token
+                        args = {'inputs_embeds': last_hidden_state}
+    
+                    outputs = self.model(**args, attention_mask=attn_mask, past_key_values=kv_cache)
+                    last_hidden_state = outputs.hidden_states[-1][:, -1:]
+                    kv_cache = outputs.past_key_values
 
 
             # Step 3: finally, predict the next segment and compute the loss
