@@ -19,8 +19,10 @@ class Biscuit:
 
         # beginning and end of thought special tokens
         self.bot, self.eot = "<bot>", "<eot>"
-        self.tokenizer.add_tokens([self.bot, self.eot])
-        self.token_trunk.resize_token_embeddings(len(self.tokenizer))
+        self.bot_embedding = torch.empty(1, self.token_trunk.model.embed_tokens.embedding_dim, device=self.device)
+        self.eot_embedding = torch.empty(1, self.token_trunk.model.embed_tokens.embedding_dim, device=self.device)
+        torch.nn.init.normal_(self.bot_embedding)
+        torch.nn.init.normal_(self.eot_embedding)
         self.token_trunk.train()
         self.latent_trunk.train()
 
@@ -46,9 +48,9 @@ class Biscuit:
             attn_ones = torch.ones(batch_size, 1, dtype=int).to(self.device)
 
             # learn to output bot token
-            if token_batch:
-                bot_token = self.tokenizer([self.bot] * batch_size, return_tensors="pt").to(self.device)
-                loss += CE_loss(outputs.logits[keep_indices, -1], bot_token.input_ids[:, 0])
+            # if token_batch:
+            #     bot_token = self.tokenizer([self.bot] * batch_size, return_tensors="pt").to(self.device)
+            #     loss += CE_loss(outputs.logits[keep_indices, -1], bot_token.input_ids[:, 0])
 
             # Step 2: then autoregressively predict a continuous chain of thought sequence
             last_hidden_state = None
@@ -56,10 +58,8 @@ class Biscuit:
             for i in range(k + 2):
                 attn_mask = torch.cat((attn_mask, attn_ones), dim=1)
                 if i == 0 or i == k + 1: # process beginning of thought or end of thought token
-                    seq = [self.bot if i == 0 else self.eot] * batch_size
-                    inputs = self.tokenizer(seq, return_tensors="pt").to(self.device)
-                    labels = inputs.input_ids if (i == 0) else None
-                    outputs = self.token_trunk(input_ids=inputs.input_ids, attention_mask=attn_mask, 
+                    inp = self.bot_embedding if i == 0 else self.eot_embedding
+                    outputs = self.token_trunk(inputs_embeds=inp.repeat(batch_size, 1, 1), attention_mask=attn_mask, 
                                                past_key_values=kv_cache)
                 else: # process new continuous thought token
                     outputs = self.latent_trunk(inputs_embeds=last_hidden_state, attention_mask=attn_mask, 
