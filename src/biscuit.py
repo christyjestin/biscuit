@@ -5,28 +5,32 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 COT_MAX_LENGTH = 6
 
 class Biscuit:
-    def __init__(self, base_model = "Qwen/Qwen2-0.5B"):
-        self.base_model = base_model
+    def __init__(self, base_model_name = "Qwen/Qwen2-0.5B"):
+        self.base_model_name = base_model_name
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.tokenizer = AutoTokenizer.from_pretrained(base_model, padding_side='left')
-        self.model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=torch.bfloat16,
-                                                          device_map="auto", 
-                                                          attn_implementation="sdpa")
-        self.model.config.pad_token_id = self.model.config.eos_token_id
-        self.model.config.output_hidden_states = True
+        self.tokenizer = AutoTokenizer.from_pretrained(base_model_name, padding_side='left')
+        self.token_trunk = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch.bfloat16,
+                                                                device_map="auto", attn_implementation="sdpa")
+        self.latent_trunk = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch.bfloat16, 
+                                                                 device_map="auto", attn_implementation="sdpa")
+        self.token_trunk.config.pad_token_id = self.token_trunk.config.eos_token_id
+        self.token_trunk.config.output_hidden_states = True
+        self.latent_trunk.config.output_hidden_states = True
 
         # beginning and end of thought special tokens
         self.bot, self.eot = "<bot>", "<eot>"
         self.tokenizer.add_tokens([self.bot, self.eot])
-        self.model.resize_token_embeddings(len(self.tokenizer))
-        self.model.train()
+        self.token_trunk.resize_token_embeddings(len(self.tokenizer))
+        self.token_trunk.train()
+        self.latent_trunk.train()
 
-
-    def compute_batch(self, prompt, segments, keep_indices_lst, no_latent=False):
+    # same process but for token_batches, the loss is just predicting the beginning of thought token
+    # while non token_batches are about using latents to upweight the probability of the discrete CoT
+    def compute_batch(self, prompt, segments, keep_indices_lst, token_batch):
         # Step 0: just process the first segment without decoding the next token
         first_segment = [prompt + segment for segment in segments[0]]
         inputs = self.tokenizer(first_segment, return_tensors="pt", padding=True).to(self.device)
-        outputs = self.model(**inputs)
+        outputs = self.token_trunk(**inputs)
         kv_cache = outputs.past_key_values
         attn_mask = inputs.attention_mask
 
@@ -41,27 +45,27 @@ class Biscuit:
             batch_size = keep_indices.shape[0]
             attn_ones = torch.ones(batch_size, 1, dtype=int).to(self.device)
 
-            if not no_latent:
-                # learn to output bot token
+            # learn to output bot token
+            if token_batch:
                 bot_token = self.tokenizer([self.bot] * batch_size, return_tensors="pt").to(self.device)
                 loss += CE_loss(outputs.logits[keep_indices, -1], bot_token.input_ids[:, 0])
 
-                # Step 2: then autoregressively predict a continuous chain of thought sequence
-                last_hidden_state = None
-                k = np.random.randint(1, COT_MAX_LENGTH + 1) # the CoT sequence has a random length
-                for i in range(k + 2):
-                    attn_mask = torch.cat((attn_mask, attn_ones), dim=1)
-                    if i == 0 or i == k + 1: # process beginning of thought or end of thought token
-                        seq = [self.bot if i == 0 else self.eot] * batch_size
-                        inputs = self.tokenizer(seq, return_tensors="pt").to(self.device)
-                        args = {'input_ids': inputs.input_ids}
-                    else: # process new continuous thought token
-                        args = {'inputs_embeds': last_hidden_state}
-    
-                    outputs = self.model(**args, attention_mask=attn_mask, past_key_values=kv_cache)
-                    last_hidden_state = outputs.hidden_states[-1][:, -1:]
-                    kv_cache = outputs.past_key_values
-
+            # Step 2: then autoregressively predict a continuous chain of thought sequence
+            last_hidden_state = None
+            k = np.random.randint(1, COT_MAX_LENGTH + 1) # the CoT sequence has a random length
+            for i in range(k + 2):
+                attn_mask = torch.cat((attn_mask, attn_ones), dim=1)
+                if i == 0 or i == k + 1: # process beginning of thought or end of thought token
+                    seq = [self.bot if i == 0 else self.eot] * batch_size
+                    inputs = self.tokenizer(seq, return_tensors="pt").to(self.device)
+                    labels = inputs.input_ids if (i == 0) else None
+                    outputs = self.token_trunk(input_ids=inputs.input_ids, attention_mask=attn_mask, 
+                                               past_key_values=kv_cache)
+                else: # process new continuous thought token
+                    outputs = self.latent_trunk(inputs_embeds=last_hidden_state, attention_mask=attn_mask, 
+                                                past_key_values=kv_cache)
+                last_hidden_state = outputs.hidden_states[-1][:, -1:]
+                kv_cache = outputs.past_key_values
 
             # Step 3: finally, predict the next segment and compute the loss
             # pad on the right side so that the CoT and the new input are contiguous
@@ -70,9 +74,10 @@ class Biscuit:
             # ignore masked tokens when computing loss
             labels = torch.where(inputs.attention_mask.bool(), inputs.input_ids, -100)
             attn_mask = torch.cat((attn_mask, inputs.attention_mask), dim=1)
-            outputs = self.model(input_ids=inputs.input_ids, attention_mask=attn_mask, 
+            outputs = self.token_trunk(input_ids=inputs.input_ids, attention_mask=attn_mask, 
                                  labels=labels, past_key_values=kv_cache)
             kv_cache = outputs.past_key_values
-            loss += outputs.loss
+            if not token_batch:
+                loss += outputs.loss
 
         return loss
