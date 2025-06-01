@@ -23,7 +23,7 @@ class Biscuit:
         self.eot_embedding = torch.empty(1, self.token_trunk.model.embed_tokens.embedding_dim, device=self.device)
         torch.nn.init.normal_(self.bot_embedding)
         torch.nn.init.normal_(self.eot_embedding)
-        self.token_trunk.train()
+
         self.latent_trunk.train()
 
     # same process but for token_batches, the loss is just predicting the beginning of thought token
@@ -36,8 +36,6 @@ class Biscuit:
         kv_cache = outputs.past_key_values
         attn_mask = inputs.attention_mask
 
-        CE_loss = torch.nn.CrossEntropyLoss()
-
         loss = torch.tensor(0.).to(self.device)
         # continuous CoT loop: produce CoT -> use it to predict next segment -> repeat
         for segment, keep_indices in zip(segments[1:], keep_indices_lst):
@@ -46,11 +44,6 @@ class Biscuit:
             attn_mask = attn_mask[keep_indices]
             batch_size = keep_indices.shape[0]
             attn_ones = torch.ones(batch_size, 1, dtype=int).to(self.device)
-
-            # learn to output bot token
-            # if token_batch:
-            #     bot_token = self.tokenizer([self.bot] * batch_size, return_tensors="pt").to(self.device)
-            #     loss += CE_loss(outputs.logits[keep_indices, -1], bot_token.input_ids[:, 0])
 
             # Step 2: then autoregressively predict a continuous chain of thought sequence
             last_hidden_state = None
